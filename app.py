@@ -429,70 +429,114 @@ with st.sidebar:
     st.divider()
     procesar = st.button("Procesar información", type="primary", width="stretch")
 
-if not procesar:
+@st.cache_data(show_spinner="Procesando información...")
+def procesar_todo(fe_bytes, fr_bytes, mb_bytes, isr_bytes, nombre_fe, nombre_fr, nombre_mb, nombre_isr):
+    """
+    Hace todo el trabajo pesado (lectura, validación, clasificación,
+    conciliación, IVA, ISR y alertas) una sola vez por combinación de
+    archivos. Streamlit cachea el resultado por el contenido de los bytes,
+    así que cambiar un filtro en la interfaz (que no cambia los archivos)
+    no vuelve a disparar todo este cálculo.
+    Regresa un diccionario con 'errores' (lista de mensajes) o, si no hay
+    errores, con todos los DataFrames y resultados ya calculados.
+    """
+    try:
+        fe_raw = pd.read_excel(io.BytesIO(fe_bytes))
+        fr_raw = pd.read_excel(io.BytesIO(fr_bytes))
+        mb_raw = pd.read_excel(io.BytesIO(mb_bytes))
+        isr_raw = pd.read_excel(io.BytesIO(isr_bytes))
+    except Exception as e:
+        return {"errores": [f"No se pudo leer alguno de los archivos. Verifica que sean archivos Excel válidos. Detalle técnico: {e}"]}
+
+    errores = []
+    errores += validar_columnas(fe_raw, "facturas_emitidas", nombre_fe)
+    errores += validar_columnas(fr_raw, "facturas_recibidas", nombre_fr)
+    errores += validar_columnas(mb_raw, "movimientos_bancarios", nombre_mb)
+    errores += validar_columnas(isr_raw, "retenciones_isr", nombre_isr)
+    if errores:
+        return {"errores": errores}
+
+    fe = preparar_dataframe(fe_raw)
+    fr = preparar_dataframe(fr_raw)
+    mb = preparar_dataframe(mb_raw)
+    isr = preparar_dataframe(isr_raw)
+
+    fe_norm, fe_nc, fe_cero = separar_notas_credito(fe, "total")
+    fr_norm, fr_nc, fr_cero = separar_notas_credito(fr, "total")
+
+    fr_clasif = clasificar_gastos(fr_norm)
+
+    ingresos_mb = mb[~mb["tipo"].isin(TIPOS_EGRESO)].copy()
+    egresos_mb = mb[mb["tipo"].isin(TIPOS_EGRESO)].copy()
+    egresos_mb["monto"] = egresos_mb["monto"].abs()
+
+    fe_conc = conciliar(fe_norm, ingresos_mb, "folio", "total", "referencia", "monto", usar_referencia_como_folio=True)
+    fr_conc = conciliar(fr_clasif, egresos_mb, "folio_gasto", "total", "referencia", "monto", usar_referencia_como_folio=False)
+
+    ingresos_marcados = marcar_movimientos_sin_documento(ingresos_mb, fe_conc)
+    egresos_marcados = marcar_movimientos_sin_documento(egresos_mb, fr_conc)
+
+    resultado_iva = calcular_iva_flujo(fe_conc, fr_conc)
+    isr_proc = procesar_isr(isr)
+
+    alertas = generar_alertas(fe_conc, fr_conc, ingresos_marcados, egresos_marcados, isr_proc, resultado_iva)
+    alertas = pd.concat([
+        alertas,
+        validar_datos_faltantes(fe, COLUMNAS_REQUERIDAS["facturas_emitidas"], "Facturas emitidas", "folio"),
+        validar_datos_faltantes(fr, COLUMNAS_REQUERIDAS["facturas_recibidas"], "Gastos", "folio_gasto"),
+        validar_importes_invalidos(fe, ["subtotal", "iva", "total"], "Facturas emitidas", "folio"),
+        validar_importes_invalidos(fr, ["subtotal", "iva", "total"], "Gastos", "folio_gasto"),
+    ], ignore_index=True)
+
+    return {
+        "errores": [],
+        "fe": fe, "fr": fr, "mb": mb, "isr": isr,
+        "fe_norm": fe_norm, "fe_nc": fe_nc, "fr_norm": fr_norm, "fr_nc": fr_nc,
+        "fr_clasif": fr_clasif, "fe_conc": fe_conc, "fr_conc": fr_conc,
+        "ingresos_marcados": ingresos_marcados, "egresos_marcados": egresos_marcados,
+        "resultado_iva": resultado_iva, "isr_proc": isr_proc, "alertas": alertas,
+    }
+
+
+# --- Control de estado: una vez procesado, cambiar un filtro no debe pedir
+#     reprocesar. Streamlit reinicia el valor del botón en cada rerun (por
+#     ejemplo al mover un filtro), así que usamos session_state para
+#     recordar que ya se procesó, y el cache de arriba evita recalcular. ---
+if "procesado" not in st.session_state:
+    st.session_state.procesado = False
+if procesar:
+    st.session_state.procesado = True
+
+if not st.session_state.procesado:
     st.info("Carga los cuatro archivos en el panel izquierdo y presiona **Procesar información** para comenzar.")
     st.stop()
 
-# --- Carga y validación ---
 faltan = [n for n, a in [("facturas_emitidas", archivo_fe), ("facturas_recibidas", archivo_fr),
                           ("movimientos_bancarios", archivo_mb), ("retenciones_isr", archivo_isr)] if a is None]
 if faltan:
     st.error("Faltan archivos por cargar: " + ", ".join(NOMBRES_BASE[f] for f in faltan))
     st.stop()
 
-try:
-    fe_raw = pd.read_excel(archivo_fe)
-    fr_raw = pd.read_excel(archivo_fr)
-    mb_raw = pd.read_excel(archivo_mb)
-    isr_raw = pd.read_excel(archivo_isr)
-except Exception as e:
-    st.error(f"No se pudo leer alguno de los archivos. Verifica que sean archivos Excel válidos. Detalle técnico: {e}")
-    st.stop()
+resultado = procesar_todo(
+    archivo_fe.getvalue(), archivo_fr.getvalue(), archivo_mb.getvalue(), archivo_isr.getvalue(),
+    archivo_fe.name, archivo_fr.name, archivo_mb.name, archivo_isr.name,
+)
 
-errores = []
-errores += validar_columnas(fe_raw, "facturas_emitidas", archivo_fe.name)
-errores += validar_columnas(fr_raw, "facturas_recibidas", archivo_fr.name)
-errores += validar_columnas(mb_raw, "movimientos_bancarios", archivo_mb.name)
-errores += validar_columnas(isr_raw, "retenciones_isr", archivo_isr.name)
-
-if errores:
+if resultado["errores"]:
     st.error("No se pudo procesar la información porque faltan columnas obligatorias:")
-    for e in errores:
+    for e in resultado["errores"]:
         st.markdown(e)
     st.stop()
 
-# --- Preparación ---
-fe = preparar_dataframe(fe_raw)
-fr = preparar_dataframe(fr_raw)
-mb = preparar_dataframe(mb_raw)
-isr = preparar_dataframe(isr_raw)
-
-fe_norm, fe_nc, fe_cero = separar_notas_credito(fe, "total")
-fr_norm, fr_nc, fr_cero = separar_notas_credito(fr, "total")
-
-fr_clasif = clasificar_gastos(fr_norm)
-
-ingresos_mb = mb[~mb["tipo"].isin(TIPOS_EGRESO)].copy()
-egresos_mb = mb[mb["tipo"].isin(TIPOS_EGRESO)].copy()
-egresos_mb["monto"] = egresos_mb["monto"].abs()
-
-fe_conc = conciliar(fe_norm, ingresos_mb, "folio", "total", "referencia", "monto", usar_referencia_como_folio=True)
-fr_conc = conciliar(fr_clasif, egresos_mb, "folio_gasto", "total", "referencia", "monto", usar_referencia_como_folio=False)
-
-ingresos_marcados = marcar_movimientos_sin_documento(ingresos_mb, fe_conc)
-egresos_marcados = marcar_movimientos_sin_documento(egresos_mb, fr_conc)
-
-resultado_iva = calcular_iva_flujo(fe_conc, fr_conc)
-isr_proc = procesar_isr(isr)
-
-alertas = generar_alertas(fe_conc, fr_conc, ingresos_marcados, egresos_marcados, isr_proc, resultado_iva)
-alertas = pd.concat([
-    alertas,
-    validar_datos_faltantes(fe, COLUMNAS_REQUERIDAS["facturas_emitidas"], "Facturas emitidas", "folio"),
-    validar_datos_faltantes(fr, COLUMNAS_REQUERIDAS["facturas_recibidas"], "Gastos", "folio_gasto"),
-    validar_importes_invalidos(fe, ["subtotal", "iva", "total"], "Facturas emitidas", "folio"),
-    validar_importes_invalidos(fr, ["subtotal", "iva", "total"], "Gastos", "folio_gasto"),
-], ignore_index=True)
+fe, fr, mb, isr = resultado["fe"], resultado["fr"], resultado["mb"], resultado["isr"]
+fe_norm, fe_nc = resultado["fe_norm"], resultado["fe_nc"]
+fr_norm, fr_nc = resultado["fr_norm"], resultado["fr_nc"]
+fr_clasif = resultado["fr_clasif"]
+fe_conc, fr_conc = resultado["fe_conc"], resultado["fr_conc"]
+ingresos_marcados, egresos_marcados = resultado["ingresos_marcados"], resultado["egresos_marcados"]
+resultado_iva = resultado["resultado_iva"]
+isr_proc = resultado["isr_proc"]
+alertas = resultado["alertas"]
 
 # --- Indicadores del tablero ---
 total_facturado = fe_norm["total"].sum()
